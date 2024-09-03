@@ -38,17 +38,22 @@ def _is_valid_deferrable_default(default: ast.AST) -> bool:
     return ast.unparse(default) == "conf.getboolean('operators', 'default_deferrable', fallback=False)"
 
 
-class DefaultDeferrableVisitor(ast.NodeVisitor):
+class DefaultDeferrableTransformer(ast.NodeTransformer):
+    EXPECTED_DEFAULT = "conf.getboolean('operators', 'default_deferrable', fallback=False)"
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, *kwargs)
         self.error_linenos: list[int] = []
+        self.error_found: bool = False
+        self.fixed: bool = False
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.FunctionDef:
         if node.name == "__init__":
             args = node.args
             arguments = reversed([*args.args, *args.posonlyargs, *args.kwonlyargs])
             defaults = reversed([*args.defaults, *args.kw_defaults])
-            for argument, default in itertools.zip_longest(arguments, defaults):
+            error_arg_index = -1
+            for arg_index, (argument, default) in enumerate(itertools.zip_longest(arguments, defaults)):
                 # argument is not deferrable
                 if argument is None or argument.arg != "deferrable":
                     continue
@@ -56,19 +61,47 @@ class DefaultDeferrableVisitor(ast.NodeVisitor):
                 # argument is deferrable, but comes with no default value
                 if default is None:
                     self.error_linenos.append(argument.lineno)
+                    error_arg_index = arg_index
                     continue
 
                 # argument is deferrable, but the default value is not valid
                 if not _is_valid_deferrable_default(default):
                     self.error_linenos.append(default.lineno)
+                    error_arg_index = arg_index
+
+            if error_arg_index != -1:
+                kw_defaults_len = len(args.kw_defaults)
+                defaults_len = len(args.defaults)
+                # not fixable, there's arg with no default value after argument "deferrable"
+                if error_arg_index > (defaults_len + kw_defaults_len):
+                    return node
+
+                expected_default_ast = ast.parse(
+                    r"conf.getboolean('operators', 'default_deferrable', fallback=False)", mode="eval"
+                ).body
+
+                if error_arg_index > kw_defaults_len - 1:
+                    # argument "deferrable" not in keyword only arguments
+                    new_index = -(error_arg_index - kw_defaults_len + 1)
+                    node.args.defaults[-(1 + new_index)] = expected_default_ast
+                else:
+                    # argument "deferrable" in keyword only arguments
+                    node.args.kw_defaults[-(1 + error_arg_index)] = expected_default_ast
+
+                self.fixed = True
+                return node
         return node
 
 
 def iter_check_deferrable_default_errors(module_filename: str) -> Iterator[str]:
     ast_tree = ast.parse(open(module_filename).read())
-    visitor = DefaultDeferrableVisitor()
-    visitor.visit(ast_tree)
-    yield from (f"{module_filename}:{lineno}" for lineno in visitor.error_linenos)
+    transformer = DefaultDeferrableTransformer()
+    modified_tree = ast.fix_missing_locations(transformer.visit(ast_tree))
+    if transformer.fixed:
+        with open(module_filename, "w") as writer:
+            writer.write(ast.unparse(modified_tree))
+
+    yield from (f"{module_filename}:{lineno}" for lineno in transformer.error_linenos)
 
 
 def main() -> int:
